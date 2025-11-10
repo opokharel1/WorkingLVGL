@@ -7,6 +7,22 @@
 #include <GT911.h>
 // #include <lvgl/src/core/lv_event.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+
+// Mutex for protecting shared dashboard data
+SemaphoreHandle_t dataMutex = NULL;
+
+// LVGL Mutex for thread safety
+SemaphoreHandle_t lvgl_mutex= NULL;
+
+// I2C Mutex for thread safety
+SemaphoreHandle_t i2c_mutex= NULL;
+
+// Flag to indicate data update
+volatile bool data_updated = false;
+
 #define SD_CS 5
 #define TFT_HOR_RES 480  // LANDSCAPE: Width first
 #define TFT_VER_RES 320  // LANDSCAPE: Height second
@@ -84,6 +100,8 @@ lv_obj_t *sidebar = NULL;
 lv_obj_t *overlay = NULL;
 bool sidebar_open = false;
 
+lv_indev_t *touch_indev = NULL;
+
 unsigned long last_time_update = 0;
 
 /* Dashboard Data Structure */
@@ -103,6 +121,19 @@ struct DashboardData {
   float current;
 } dashData;
 
+// Task handles
+TaskHandle_t rs485TaskHandle = NULL;
+TaskHandle_t uiTaskHandle = NULL;
+
+// // Mutex for protecting shared dashboard data
+// SemaphoreHandle_t dataMutex;
+
+// // LVGL Mutex for thread safety 
+// SemaphoreHandle_t lvgl_mutex; 
+
+// // Flag to indicate data update
+// volatile bool data_updated = false;
+
 /* Forward declarations */
 void create_ev_dashboard_ui();
 
@@ -117,6 +148,9 @@ void show_voltage_screen();
 void show_temperature_screen();
 void show_statistics_screen();
 void show_settings_screen();
+void update_time_display();
+
+void update_ui_element(uint8_t id);
 
 /* Initialize dashboard data with defaults */
 void init_dashboard_data() {
@@ -180,27 +214,142 @@ bool validateFrame(uint8_t* frame, uint16_t len) {
   return true;
 }
 
-/* Touch callback */
-void my_touch_read(lv_indev_t *indev, lv_indev_data_t *data) {
-  uint8_t touches = ts.touched(GT911_MODE_POLLING);
-  if (touches) {
-    GTPoint *p = ts.getPoints();
-    data->point.x = TFT_HOR_RES - p->y;
-    data->point.y = p->x;
-    data->state = LV_INDEV_STATE_PRESSED;
+volatile uint32_t touch_callback_count = 0;
+volatile uint32_t touch_detected_count = 0;
 
-    Serial.printf("[TOUCH] Raw: (%d,%d) -> Screen:(%d,%d)\n", p->x, p->y, data->point.x, data->point.y);
-  } else { 
-    data->state = LV_INDEV_STATE_RELEASED;
+void my_touch_read(lv_indev_t *indev, lv_indev_data_t *data) {
+    // **FIX #3: Increase timeout or remove mutex**
+    if(xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50))) {  // 50ms instead of 10ms
+        uint8_t touches = ts.touched(GT911_MODE_POLLING);
+        if (touches) {
+            GTPoint *p = ts.getPoints();
+            data->point.x = TFT_HOR_RES - p->y;
+            data->point.y = p->x;
+            data->state = LV_INDEV_STATE_PRESSED;
+            Serial.printf("Touch: x=%d, y=%d\n", data->point.x, data->point.y);
+        } else {
+            data->state = LV_INDEV_STATE_RELEASED;
+        }
+        xSemaphoreGive(i2c_mutex);
+    } else {
+        // Don't fail silently - log it!
+        Serial.println("Touch mutex timeout!");
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
+
+/* ===== Safe Touch Test ===== */
+void testTouch() {
+  Serial.println("\n=== Touch Test Starting ===");
+  Serial.println("Please touch the screen...");
+  
+  for(int i = 0; i < 10; i++) {
+    if(xSemaphoreTake(i2c_mutex, 100 / portTICK_PERIOD_MS)) {
+      uint8_t touches = ts.touched(GT911_MODE_POLLING);
+      if(touches) {
+        GTPoint *p = ts.getPoints();
+        Serial.printf("[TEST] Touch detected! Raw: x=%d, y=%d\n", p->x, p->y);
+      } else {
+        Serial.println("[TEST] No touch");
+      }
+      xSemaphoreGive(i2c_mutex);
+    } else {
+      Serial.println("[TEST] Failed to get I2C mutex!");
+    }
+    delay(500);
+  }
+  Serial.println("=== Touch Test Complete ===\n");
+}
+
+/* ===== INSTRUMENTED UI Task ===== */
+void uiTask(void *parameter) {
+  Serial.println("UI Task started");
+  
+  unsigned long lastTickMillis = 0;
+  unsigned long last_time_update = 0;
+  
+  while(1) {
+    // **FIX #1: Add lv_tick_inc()!**
+    unsigned long tickPeriod = millis() - lastTickMillis;
+    lastTickMillis = millis();
+    lv_tick_inc(tickPeriod);
+    
+    // **FIX #2: Remove mutex if it's causing issues**
+    lv_timer_handler();
+    
+    // Update time display
+    if (millis() - last_time_update > 1000) {
+      update_time_display();
+      last_time_update = millis();
+    }
+    
+    // Handle RS485 data updates
+    if(data_updated) {
+      data_updated = false;
+      if(xSemaphoreTake(dataMutex, 10 / portTICK_PERIOD_MS)) {
+        // Update all UI elements
+        update_ui_element(ID_SPEED);
+        update_ui_element(ID_RANGE);
+        update_ui_element(ID_CONSUMPTION);
+        update_ui_element(ID_TRIP);
+        update_ui_element(ID_ODOMETER);
+        update_ui_element(ID_AVG_SPEED);
+        update_ui_element(ID_TEMP);
+        update_ui_element(ID_AMBIENT_TEMP);
+        update_ui_element(ID_MODE);
+        update_ui_element(ID_ARMED);
+        update_ui_element(ID_SOC);
+        update_ui_element(ID_VOLTAGE);
+        update_ui_element(ID_CURRENT);
+     
+        xSemaphoreGive(dataMutex);
+      }
+    }
+    
+    vTaskDelay(5 / portTICK_PERIOD_MS);
   }
 }
 
+
+/* ===== BETTER: Add I2C health check ===== */
+// void check_i2c_bus() {
+//   Serial.println("[I2C] Checking bus health...");
+  
+//   Wire.beginTransmission(0x5D); // GT911 I2C address
+//   uint8_t error = Wire.endTransmission();
+  
+//   if (error == 0) {
+//     Serial.println("[I2C] GT911 detected at 0x5D - OK");
+//   } else {
+//     Serial.printf("[I2C] GT911 not responding! Error: %d\n", error);
+//     Serial.println("[I2C] Attempting to re-initialize touch sensor...");
+    
+//     // Re-initialize touch
+//     ts.begin(TOUCH_INT, TOUCH_RST);
+//     delay(100);
+    
+//     Wire.beginTransmission(0x5D);
+//     error = Wire.endTransmission();
+//     if (error == 0) {
+//       Serial.println("[I2C] Touch sensor re-initialized successfully!");
+//     } else {
+//       Serial.println("[I2C] Touch sensor re-init FAILED!");
+//     }
+//   }
+// }
+
 static void menu_btn_event_cb(lv_event_t *e) {
- lv_event_code_t code = lv_event_get_code(e);
- Serial.printf("Menu button event code: %d\n", code);
+  lv_event_code_t code = lv_event_get_code(e);
+  Serial.printf("[MENU BTN] Event received! Code: %d\n", code);
+  
   if (code == LV_EVENT_CLICKED) {
-    Serial.println("Menu button clicked");
+    Serial.println("[MENU BTN] ✓ CLICKED - Toggling sidebar");
+    Serial.printf("[MENU BTN] Current sidebar state: %s\n", sidebar_open ? "OPEN" : "CLOSED");
     toggle_sidebar();
+  } else if (code == LV_EVENT_PRESSED) {
+    Serial.println("[MENU BTN] ↓ PRESSED");
+  } else if (code == LV_EVENT_RELEASED) {
+    Serial.println("[MENU BTN] ↑ RELEASED");
   }
 }
 /* Load image from SD card into RAM */
@@ -324,13 +473,16 @@ void update_ui_element(uint8_t id) {
 }
 
 void toggle_sidebar() {
-    Serial.printf("[SIDEBAR] Toggle called, current state: %s\n", sidebar_open ? "OPEN" : "CLOSED");
+    Serial.println("Toggle sidebar called");
     if(sidebar_open) {
+        Serial.println("Closing sidebar");
         close_sidebar();
+        sidebar_open = false;
     } else {
+        Serial.println("Opening sidebar");
         show_sidebar();
+        sidebar_open = true;
     }
-    sidebar_open = !sidebar_open;
 }
 
 void show_sidebar() {
@@ -481,43 +633,41 @@ void create_ev_dashboard_ui() {
   lv_obj_set_style_radius(top_bar, 0, 0);
   lv_obj_set_style_pad_all(top_bar, 0, 0);
 
-   // Create menu button
+  // Create menu button
   menu_btn = lv_btn_create(top_bar);
   lv_obj_set_size(menu_btn, 50, 45);
-  lv_obj_align(menu_btn, LV_ALIGN_TOP_LEFT, 0, 0);
-  lv_obj_set_style_bg_color(menu_btn, lv_color_hex(0x333333), 0);
-  // lv_obj_set_style_radius(menu_btn, 20, 0);
-  // lv_obj_set_style_border_width(menu_btn, 0, 0);
-  // lv_obj_set_style_shadow_width(menu_btn, 0, 0);
-
-  //making button clickable
-  lv_obj_clear_flag(menu_btn, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_align(menu_btn, LV_ALIGN_LEFT_MID, 0, 0);
   lv_obj_add_flag(menu_btn, LV_OBJ_FLAG_CLICKABLE);
-   
-    // Add menu symbol
+  lv_obj_clear_flag(menu_btn, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+  lv_obj_set_style_bg_color(menu_btn, lv_color_hex(0x333333), 0);
+
+  // Create menu symbol
   lv_obj_t *menu_label = lv_label_create(menu_btn);
-  lv_label_set_text(menu_label, LV_SYMBOL_BARS);
-  lv_obj_set_style_text_font(menu_label, &lv_font_montserrat_20, 0);
-  lv_obj_set_style_bg_color(menu_label, lv_color_hex(0x333333), 0);
-  // lv_obj_set_style_text_color(menu_label, lv_color_white(), 0);
+  lv_label_set_text(menu_label, LV_SYMBOL_LIST);
   lv_obj_center(menu_label);
 
-  lv_obj_add_event_cb(menu_btn, menu_btn_event_cb, LV_EVENT_CLICKED, NULL);
-    
-  lv_obj_set_style_bg_color(menu_btn, lv_color_hex(0x333333), LV_STATE_PRESSED);
-  // Add click event handler
-  // lv_obj_add_event_cb(menu_btn, [](lv_event_t *e) {
-  //   if(lv_event_get_code(e) == LV_EVENT_CLICKED) {  // Use proper event code getter
-  //     toggle_sidebar();
-  //   }
-  // }, LV_EVENT_CLICKED, NULL);
-
+  // Add event handler - Simplified version
+  lv_obj_add_event_cb(menu_btn, [](lv_event_t *e) {
+      Serial.println("Menu button event received");
+      if(lv_event_get_code(e) == LV_EVENT_CLICKED) {
+          Serial.println("Menu button clicked!");
+          toggle_sidebar();
+      }
+  }, LV_EVENT_CLICKED, NULL);
+  
   time_label = lv_label_create(top_bar);
   // lv_label_set_text(time_label, "9:41 AM");
   lv_obj_set_style_text_color(time_label, lv_color_black(), 0);
   lv_obj_set_style_text_font(time_label, &lv_font_montserrat_18, 0);
   lv_obj_align(time_label, LV_ALIGN_CENTER, 0, 0);
   update_time_display();
+
+  // TEMPORARY TEST: Click anywhere on screen
+  lv_obj_add_event_cb(scr, [](lv_event_t *e) {
+  if(lv_event_get_code(e) == LV_EVENT_CLICKED) {
+    Serial.println("[TEST] Screen clicked!");
+  }
+  }, LV_EVENT_CLICKED, NULL);
   
   // lv_obj_t *menu_btn = lv_label_create(top_bar);
   // lv_label_set_text(menu_btn, "Menu");
@@ -661,218 +811,177 @@ void create_ev_dashboard_ui() {
   Serial.println("EV dashboard UI created!");
 }
 
-// Close the sidebar (and hide overlay)
-// void close_sidebar() {
-//   if (sidebar) {
-//     lv_obj_add_flag(sidebar, LV_OBJ_FLAG_HIDDEN);
-//   }
-//   if (overlay) {
-//     lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
-//   }
-//   sidebar_open = false;
-//   lv_refr_now(disp);
-// }
+// 
 
-// Callback for overlay clicks -> closes sidebar
-// static void overlay_event_cb(lv_event_t *e) {
-//   LV_UNUSED(e);
-//   close_sidebar();
-// }
-
-
-
-/* Process RS485 frames and update UI */
-void read_rs485_frames() {
-  // Read available bytes from Serial1
-  while (Serial1.available()) {
-    if (bufferPos < sizeof(serialBuffer)) {
-      serialBuffer[bufferPos++] = Serial1.read();
-    } else {
-      memmove(serialBuffer, serialBuffer+1, sizeof(serialBuffer)-1);
-      bufferPos--;
-      serialBuffer[bufferPos++] = Serial1.read();
-    }
-    yield();
-  }
+// RS485 Task - runs on Core 0
+void rs485Task(void *parameter) {
+  Serial.println("[RS485 Task] Started on Core 0");
   
-  // Process complete frames
-  bool frameFound = true; 
-  while (frameFound && bufferPos >= 6) {
-    frameFound = false;
-    
-    for (uint16_t i = 0; i < bufferPos-1; i++) {
-      if (serialBuffer[i] == STX1 && serialBuffer[i+1] == STX2) {
-        if (i+3 >= bufferPos) break;
-        
-        uint16_t declaredLength = (serialBuffer[i+2] << 8) | serialBuffer[i+3];
-        uint16_t frameLength = declaredLength + 6;
-        
-        if (i + frameLength <= bufferPos) {
-          if (validateFrame(&serialBuffer[i], frameLength)) {
-            Serial.println("\n[RS485] Valid frame received");
-            
-            uint8_t infoEnd = i + 4 + declaredLength - 5;
-            uint8_t updatedIDs[20];
-            uint8_t updateCount = 0;
-            
-            // Parse all data fields
-            for (uint8_t j = i+11; j < infoEnd;) {
-              uint8_t id = serialBuffer[j++];
-              
-              switch (id) {
-                case ID_SOC:
-                  dashData.soc = serialBuffer[j++];
-                  Serial.printf("  SOC: %d%%\n", dashData.soc);
-                  updatedIDs[updateCount++] = id;
-                  break;
-                  
-                case ID_VOLTAGE: {
-                  uint16_t v = (serialBuffer[j] << 8) | serialBuffer[j+1];
-                  dashData.voltage = v * 0.01f;
-                  j += 2;
-                  Serial.printf("  Voltage: %.2f V\n", dashData.voltage);
-                  updatedIDs[updateCount++] = id;
-                  break;
-                }
-                
-                case ID_CURRENT: {
-                  uint16_t c = (serialBuffer[j] << 8) | serialBuffer[j+1];
-                  dashData.current = (c & 0x8000) ? -(c & 0x7FFF) * 0.01f : c * 0.01f;
-                  j += 2;
-                  Serial.printf("  Current: %.2f A\n", dashData.current);
-                  updatedIDs[updateCount++] = id;
-                  break;
-                }
-                
-                case ID_TEMP: {
-                  uint16_t t = (serialBuffer[j] << 8) | serialBuffer[j+1];
-                  dashData.battery_temp = (int)(t * 0.1f);
-                  j += 2;
-                  Serial.printf("  Battery Temp: %d°C\n", dashData.battery_temp);
-                  updatedIDs[updateCount++] = id;
-                  break;
-                }
-                
-                case ID_SPEED: {
-                  uint16_t s = (serialBuffer[j] << 8) | serialBuffer[j+1];
-                  dashData.speed = (int)(s * 0.1f);
-                  j += 2;
-                  Serial.printf("  Speed: %d km/h\n", dashData.speed);
-                  updatedIDs[updateCount++] = id;
-                  break;
-                }
-                
-                case ID_MODE: {
-                  uint8_t m = serialBuffer[j++];
-                  if (m == MODE_ECO) dashData.mode = "Eco";
-                  else if (m == MODE_CITY) dashData.mode = "City";
-                  else if (m == MODE_SPORT) dashData.mode = "Sport";
-                  Serial.printf("  Mode: %s\n", dashData.mode.c_str());
-                  updatedIDs[updateCount++] = id;
-                  break;
-                }
-                
-                case ID_ARMED: {
-                  uint8_t a = serialBuffer[j++];
-                  dashData.status = a ? "ARMED" : "DISARMED";
-                  Serial.printf("  Status: %s\n", dashData.status.c_str());
-                  updatedIDs[updateCount++] = id;
-                  break;
-                }
-                
-                case ID_RANGE: {
-                  uint16_t r = (serialBuffer[j] << 8) | serialBuffer[j+1];
-                  dashData.range = (int)(r * 0.1f);
-                  j += 2;
-                  Serial.printf("  Range: %d km\n", dashData.range);
-                  updatedIDs[updateCount++] = id;
-                  break;
-                }
-                
-                case ID_CONSUMPTION: {
-                  uint16_t c = (serialBuffer[j] << 8) | serialBuffer[j+1];
-                  dashData.avg_wkm = (int)(c * 0.1f);
-                  j += 2;
-                  Serial.printf("  Consumption: %d W/km\n", dashData.avg_wkm);
-                  updatedIDs[updateCount++] = id;
-                  break;
-                }
-                
-                case ID_AMBIENT_TEMP: {
-                  uint16_t t = (serialBuffer[j] << 8) | serialBuffer[j+1];
-                  dashData.motor_temp = (int)(t * 0.1f);
-                  j += 2;
-                  Serial.printf("  Motor Temp: %d°C\n", dashData.motor_temp);
-                  updatedIDs[updateCount++] = id;
-                  break;
-                }
-                
-                case ID_TRIP: {
-                  uint16_t t = (serialBuffer[j] << 8) | serialBuffer[j+1];
-                  dashData.trip = (int)(t * 0.1f);
-                  j += 2;
-                  Serial.printf("  Trip: %d km\n", dashData.trip);
-                  updatedIDs[updateCount++] = id;
-                  break;
-                }
-                
-                case ID_ODOMETER: {
-                  uint32_t o = (serialBuffer[j] << 24) | (serialBuffer[j+1] << 16) | 
-                              (serialBuffer[j+2] << 8) | serialBuffer[j+3];
-                  dashData.odo = (int)(o * 0.1f);
-                  j += 4;
-                  Serial.printf("  Odometer: %d km\n", dashData.odo);
-                  updatedIDs[updateCount++] = id;
-                  break;
-                }
-                
-                case ID_AVG_SPEED: {
-                  uint16_t as = (serialBuffer[j] << 8) | serialBuffer[j+1];
-                  dashData.avg_kmh = (int)(as * 0.1f);
-                  j += 2;
-                  Serial.printf("  Avg Speed: %d km/h\n", dashData.avg_kmh);
-                  updatedIDs[updateCount++] = id;
-                  break;
-                }
-
-                default:
-                  Serial.printf("  Unknown ID: 0x%02X\n", id);
-                  if (id == ID_ODOMETER) j += 4;
-                  else if (id >= 0x80 && id <= 0x8F) j += 2;
-                  else j++;
-                  break;
-              }
-            }
-            
-            // Update only changed UI elements
-            Serial.printf("[UI] Updating %d elements...\n", updateCount);
-            for (uint8_t k = 0; k < updateCount; k++) {
-              update_ui_element(updatedIDs[k]);
-            }
-            
-            // Single display refresh
-            lv_refr_now(disp);
-            Serial.println("[UI] Display updated\n");
-            
-            // Remove processed frame
-            memmove(serialBuffer, &serialBuffer[i + frameLength], 
-                    bufferPos - (i + frameLength));
-            bufferPos -= (i + frameLength);
-            frameFound = true;
-            break;
-          } else {
-            i++; 
-          }
-        } else {
-          break;
-        }
+  while(1) {
+    // Read available bytes from Serial1
+    while (Serial1.available()) {
+      if (bufferPos < sizeof(serialBuffer)) {
+        serialBuffer[bufferPos++] = Serial1.read();
+      } else {
+        memmove(serialBuffer, serialBuffer+1, sizeof(serialBuffer)-1);
+        bufferPos--;
+        serialBuffer[bufferPos++] = Serial1.read();
       }
     }
     
-    if (!frameFound && bufferPos > 200) {
-      Serial.println("[WARNING] Buffer full, clearing");
-      bufferPos = 0;
+    // Process complete frames
+    bool frameFound = true; 
+    while (frameFound && bufferPos >= 6) {
+      frameFound = false;
+      
+      for (uint16_t i = 0; i < bufferPos-1; i++) {
+        if (serialBuffer[i] == STX1 && serialBuffer[i+1] == STX2) {
+          if (i+3 >= bufferPos) break;
+          
+          uint16_t declaredLength = (serialBuffer[i+2] << 8) | serialBuffer[i+3];
+          uint16_t frameLength = declaredLength + 6;
+          
+          if (i + frameLength <= bufferPos) {
+            if (validateFrame(&serialBuffer[i], frameLength)) {
+              Serial.println("\n[RS485] Valid frame received");
+              
+              uint8_t infoEnd = i + 4 + declaredLength - 5;
+              
+              // Lock mutex before updating shared data
+              if(xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+                
+                // Parse all data fields
+                for (uint8_t j = i+11; j < infoEnd;) {
+                  uint8_t id = serialBuffer[j++];
+                  
+                  switch (id) {
+                    case ID_SOC:
+                      dashData.soc = serialBuffer[j++];
+                      break;
+                      
+                    case ID_VOLTAGE: {
+                      uint16_t v = (serialBuffer[j] << 8) | serialBuffer[j+1];
+                      dashData.voltage = v * 0.01f;
+                      j += 2;
+                      break;
+                    }
+                    
+                    case ID_CURRENT: {
+                      uint16_t c = (serialBuffer[j] << 8) | serialBuffer[j+1];
+                      dashData.current = (c & 0x8000) ? -(c & 0x7FFF) * 0.01f : c * 0.01f;
+                      j += 2;
+                      break;
+                    }
+                    
+                    case ID_TEMP: {
+                      uint16_t t = (serialBuffer[j] << 8) | serialBuffer[j+1];
+                      dashData.battery_temp = (int)(t * 0.1f);
+                      j += 2;
+                      break;
+                    }
+                    
+                    case ID_SPEED: {
+                      uint16_t s = (serialBuffer[j] << 8) | serialBuffer[j+1];
+                      dashData.speed = (int)(s * 0.1f);
+                      j += 2;
+                      break;
+                    }
+                    
+                    case ID_MODE: {
+                      uint8_t m = serialBuffer[j++];
+                      if (m == MODE_ECO) dashData.mode = "Eco";
+                      else if (m == MODE_CITY) dashData.mode = "City";
+                      else if (m == MODE_SPORT) dashData.mode = "Sport";
+                      break;
+                    }
+                    
+                    case ID_ARMED: {
+                      uint8_t a = serialBuffer[j++];
+                      dashData.status = a ? "ARMED" : "DISARMED";
+                      break;
+                    }
+                    
+                    case ID_RANGE: {
+                      uint16_t r = (serialBuffer[j] << 8) | serialBuffer[j+1];
+                      dashData.range = (int)(r * 0.1f);
+                      j += 2;
+                      break;
+                    }
+                    
+                    case ID_CONSUMPTION: {
+                      uint16_t c = (serialBuffer[j] << 8) | serialBuffer[j+1];
+                      dashData.avg_wkm = (int)(c * 0.1f);
+                      j += 2;
+                      break;
+                    }
+                    
+                    case ID_AMBIENT_TEMP: {
+                      uint16_t t = (serialBuffer[j] << 8) | serialBuffer[j+1];
+                      dashData.motor_temp = (int)(t * 0.1f);
+                      j += 2;
+                      break;
+                    }
+                    
+                    case ID_TRIP: {
+                      uint16_t t = (serialBuffer[j] << 8) | serialBuffer[j+1];
+                      dashData.trip = (int)(t * 0.1f);
+                      j += 2;
+                      break;
+                    }
+                    
+                    case ID_ODOMETER: {
+                      uint32_t o = (serialBuffer[j] << 24) | (serialBuffer[j+1] << 16) | 
+                                  (serialBuffer[j+2] << 8) | serialBuffer[j+3];
+                      dashData.odo = (int)(o * 0.1f);
+                      j += 4;
+                      break;
+                    }
+                    
+                    case ID_AVG_SPEED: {
+                      uint16_t as = (serialBuffer[j] << 8) | serialBuffer[j+1];
+                      dashData.avg_kmh = (int)(as * 0.1f);
+                      j += 2;
+                      break;
+                    }
+
+                    default:
+                      if (id == ID_ODOMETER) j += 4;
+                      else if (id >= 0x80 && id <= 0x8F) j += 2;
+                      else j++;
+                      break;
+                  }
+                }
+                
+                // Set flag to update UI
+                data_updated = true;
+                
+                xSemaphoreGive(dataMutex);
+              }
+              
+              Serial.println("[RS485] Data updated");
+              
+              // Remove processed frame
+              memmove(serialBuffer, &serialBuffer[i + frameLength], 
+                      bufferPos - (i + frameLength));
+              bufferPos -= (i + frameLength);
+              frameFound = true;
+              break;
+            } else {
+              i++; 
+            }
+          } else {
+            break;
+          }
+        }
+      }
+      
+      if (!frameFound && bufferPos > 200) {
+        Serial.println("[WARNING] Buffer full, clearing");
+        bufferPos = 0;
+      }
     }
+    
+    vTaskDelay(5 / portTICK_PERIOD_MS);
   }
 }
 
@@ -1190,7 +1299,12 @@ void setup() {
 
   /* Initialize touch */
   Wire.begin(TOUCH_SDA, TOUCH_SCL);
+  Wire.setClock(400000);
+  Serial.println("I2C bus initialized");
+
   ts.begin(TOUCH_INT, TOUCH_RST);
+  delay(200); // Give touch sensor time to initialize
+  Serial.println("Touch sensor initialized");
 
   /* Allocate draw buffer */
   draw_buf = heap_caps_malloc(
@@ -1209,10 +1323,31 @@ void setup() {
 
   TFT_eSPI().setRotation(3);
 
-  /* Setup touch input */
-  lv_indev_t *indev = lv_indev_create();
-  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
-  lv_indev_set_read_cb(indev, my_touch_read);
+   // VERIFY input device still registered
+  // if(touch_indev) {
+  //   lv_display_t *assoc_disp = lv_indev_get_display(touch_indev);
+  //   Serial.printf("After UI creation - Input still on display: 0x%08X\n", 
+  //                 (uint32_t)assoc_disp);
+  // }
+
+  // dataMutex = xSemaphoreCreateMutex();
+  lvgl_mutex = xSemaphoreCreateMutex();
+
+  /* CRITICAL: Create I2C mutex BEFORE setting up touch input */
+  i2c_mutex = xSemaphoreCreateMutex();
+  if(i2c_mutex == NULL) {
+    Serial.println("ERROR: Failed to create I2C mutex!");
+    while(1) delay(1000);
+  }
+  Serial.println("I2C mutex created");
+
+  /* Initialize touch input device - CRITICAL: Do this before UI creation */
+  touch_indev = lv_indev_create();
+  lv_indev_set_type(touch_indev, LV_INDEV_TYPE_POINTER);
+  lv_indev_set_read_cb(touch_indev, my_touch_read);
+  lv_indev_set_display(touch_indev, disp);
+
+  Serial.printf("Touch input device created: 0x%08X\n", (uint32_t)touch_indev);
 
   /* Show splash screen */
   lv_obj_t *scr = lv_scr_act();
@@ -1234,6 +1369,14 @@ void setup() {
   lv_image_set_src(img, &img_dsc);
   lv_obj_align(img, LV_ALIGN_CENTER, 0, 4);
 
+  // Test that LVGL works BEFORE splash
+  Serial.println("\nTesting LVGL before splash...");
+  for(int i = 0; i < 5; i++) {
+    lv_timer_handler();
+    Serial.printf("  lv_timer_handler() call %d - touch callbacks: %lu\n", i+1, touch_callback_count);
+    delay(10);
+  }
+
   lv_refr_now(disp);
   delay(3000);
 
@@ -1250,22 +1393,76 @@ void setup() {
   lv_refr_now(disp);
 
   Serial.println("\n=== Setup Complete ===");
+
+  /* Check I2C bus health */
+  // check_i2c_bus();
+  // This is the test code for touch:
+
+  Serial.println("Touch test: Please touch the screen in the next 5 seconds...");
+  testTouch();
+
+  // Create LVGL mutex 
+  // lvgl_mutex = xSemaphoreCreateMutex();
+  // if(lvgl_mutex == NULL) {
+  //   Serial.println("ERROR: Failed to create LVGL mutex!");
+  //   while(1) delay(1000);
+  // }
+  // Serial.println("LVGL mutex created");
+
+  // Create mutex for protecting shared data
+  dataMutex = xSemaphoreCreateMutex();
+  if(dataMutex == NULL) {
+    Serial.println("ERROR: Failed to create data mutex!");
+    while(1) delay(1000);
+  }
+  Serial.println("Data mutex created");
+
+    // Create RS485 task on Core 0
+  xTaskCreatePinnedToCore(
+    rs485Task,           // Task function
+    "RS485_Task",        // Task name
+    4096,                // Stack size
+    NULL,                // Parameters
+    2,                   // Priority (lower than UI)
+    &rs485TaskHandle,    // Task handle
+    0                    // Core 0
+  );
+
+  // Create UI task on Core 1
+  xTaskCreatePinnedToCore(
+    uiTask,              // Task function
+    "UI_Task",           // Task name
+    8192,                // Stack size (larger for LVGL)
+    NULL,                // Parameters
+    1,                   // Priority (higher than RS485)
+    &uiTaskHandle,     // Task handle
+    1                    // Core 1
+  );
+  Serial.println("RTOS Tasks Created!");
+  Serial.println("Touch should work now!");
   Serial.println("Waiting for RS485 data...");
+  Serial.println("Try touching the menu button...");
 }
+
 
 // unsigned long last_time_update = 0;
 
 void loop() {
-  lv_timer_handler();
+  // lv_timer_handler();
 
-  // Update time every second
-  if (time_label != NULL &&millis() - last_time_update > 1000) {
-    update_time_display();
-    last_time_update = millis();
-  }
+  // // Update time every second
+  // if (time_label != NULL &&millis() - last_time_update > 1000) {
+  //   update_time_display();
+  //   last_time_update = millis();
+  // }
 
-  // Process RS485 frames and auto-update UI
-  read_rs485_frames();
+  // // Process RS485 frames and auto-update UI
+  // read_rs485_frames();
 
-  delay(5);
+  // delay(5);
+
+  // vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+  vTaskDelay(portMAX_DELAY); 
+
 }
