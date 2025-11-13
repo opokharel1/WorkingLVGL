@@ -125,15 +125,6 @@ struct DashboardData {
 TaskHandle_t rs485TaskHandle = NULL;
 TaskHandle_t uiTaskHandle = NULL;
 
-// // Mutex for protecting shared dashboard data
-// SemaphoreHandle_t dataMutex;
-
-// // LVGL Mutex for thread safety 
-// SemaphoreHandle_t lvgl_mutex; 
-
-// // Flag to indicate data update
-// volatile bool data_updated = false;
-
 /* Forward declarations */
 void create_ev_dashboard_ui();
 
@@ -168,6 +159,8 @@ void init_dashboard_data() {
   dashData.voltage = 23.0;
   dashData.current = 0.0;
 }
+
+volatile int pending_screen = -1;
 
 // ===== CRC-16 Modbus Calculation =====
 uint16_t calculateChecksum(const uint8_t *data, uint16_t length) {
@@ -218,7 +211,7 @@ volatile uint32_t touch_callback_count = 0;
 volatile uint32_t touch_detected_count = 0;
 
 void my_touch_read(lv_indev_t *indev, lv_indev_data_t *data) {
-    // **FIX #3: Increase timeout or remove mutex**
+   
     if(xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50))) {  // 50ms instead of 10ms
         uint8_t touches = ts.touched(GT911_MODE_POLLING);
         if (touches) {
@@ -239,27 +232,27 @@ void my_touch_read(lv_indev_t *indev, lv_indev_data_t *data) {
 }
 
 /* ===== Safe Touch Test ===== */
-void testTouch() {
-  Serial.println("\n=== Touch Test Starting ===");
-  Serial.println("Please touch the screen...");
+// void testTouch() {
+//   Serial.println("\n=== Touch Test Starting ===");
+//   Serial.println("Please touch the screen...");
   
-  for(int i = 0; i < 10; i++) {
-    if(xSemaphoreTake(i2c_mutex, 100 / portTICK_PERIOD_MS)) {
-      uint8_t touches = ts.touched(GT911_MODE_POLLING);
-      if(touches) {
-        GTPoint *p = ts.getPoints();
-        Serial.printf("[TEST] Touch detected! Raw: x=%d, y=%d\n", p->x, p->y);
-      } else {
-        Serial.println("[TEST] No touch");
-      }
-      xSemaphoreGive(i2c_mutex);
-    } else {
-      Serial.println("[TEST] Failed to get I2C mutex!");
-    }
-    delay(500);
-  }
-  Serial.println("=== Touch Test Complete ===\n");
-}
+//   for(int i = 0; i < 10; i++) {
+//     if(xSemaphoreTake(i2c_mutex, 100 / portTICK_PERIOD_MS)) {
+//       uint8_t touches = ts.touched(GT911_MODE_POLLING);
+//       if(touches) {
+//         GTPoint *p = ts.getPoints();
+//         Serial.printf("[TEST] Touch detected! Raw: x=%d, y=%d\n", p->x, p->y);
+//       } else {
+//         Serial.println("[TEST] No touch");
+//       }
+//       xSemaphoreGive(i2c_mutex);
+//     } else {
+//       Serial.println("[TEST] Failed to get I2C mutex!");
+//     }
+//     delay(500);
+//   }
+//   Serial.println("=== Touch Test Complete ===\n");
+// }
 
 /* ===== INSTRUMENTED UI Task ===== */
 void uiTask(void *parameter) {
@@ -269,13 +262,62 @@ void uiTask(void *parameter) {
   unsigned long last_time_update = 0;
   
   while(1) {
-    // **FIX #1: Add lv_tick_inc()!**
+    // Update LVGL tick
     unsigned long tickPeriod = millis() - lastTickMillis;
     lastTickMillis = millis();
     lv_tick_inc(tickPeriod);
     
-    // **FIX #2: Remove mutex if it's causing issues**
+    // Process LVGL events (callbacks execute here)
     lv_timer_handler();
+    
+    // **NEW: Handle screen switching AFTER events are done**
+    if(pending_screen >= 0) {
+      int screen_id = pending_screen;
+      pending_screen = -1;  // Clear flag
+      
+      Serial.printf("UI Task: Switching to screen %d\n", screen_id);
+      
+      // Delete sidebar (now safe - event callback has returned)
+       if(sidebar) {
+        lv_obj_delete(sidebar);
+        sidebar = NULL;
+      }
+      if(overlay) {
+        lv_obj_delete(overlay);
+        overlay = NULL;
+      }
+      
+      // Switch screens
+      switch(screen_id) {
+        case 0:
+          Serial.println("Opening Battery Screen...");
+          show_battery_screen();
+          break;
+        case 1:
+          Serial.println("Opening Voltage Screen...");
+          show_voltage_screen();
+          break;
+        case 2:
+          Serial.println("Opening Temperature Screen...");
+          show_temperature_screen();
+          break;
+        case 3:
+          Serial.println("Opening Statistics Screen...");
+          show_statistics_screen();
+          break;
+        case 4:
+          Serial.println("Opening Settings Screen...");
+          show_settings_screen();
+          break;
+        case 5:
+          Serial.println("Returning to Dashboard...");
+          create_ev_dashboard_ui();
+          break;
+      }
+      
+      Serial.println("Screen switch complete");
+      
+    }
     
     // Update time display
     if (millis() - last_time_update > 1000) {
@@ -287,7 +329,6 @@ void uiTask(void *parameter) {
     if(data_updated) {
       data_updated = false;
       if(xSemaphoreTake(dataMutex, 10 / portTICK_PERIOD_MS)) {
-        // Update all UI elements
         update_ui_element(ID_SPEED);
         update_ui_element(ID_RANGE);
         update_ui_element(ID_CONSUMPTION);
@@ -301,7 +342,6 @@ void uiTask(void *parameter) {
         update_ui_element(ID_SOC);
         update_ui_element(ID_VOLTAGE);
         update_ui_element(ID_CURRENT);
-     
         xSemaphoreGive(dataMutex);
       }
     }
@@ -309,34 +349,6 @@ void uiTask(void *parameter) {
     vTaskDelay(5 / portTICK_PERIOD_MS);
   }
 }
-
-
-/* ===== BETTER: Add I2C health check ===== */
-// void check_i2c_bus() {
-//   Serial.println("[I2C] Checking bus health...");
-  
-//   Wire.beginTransmission(0x5D); // GT911 I2C address
-//   uint8_t error = Wire.endTransmission();
-  
-//   if (error == 0) {
-//     Serial.println("[I2C] GT911 detected at 0x5D - OK");
-//   } else {
-//     Serial.printf("[I2C] GT911 not responding! Error: %d\n", error);
-//     Serial.println("[I2C] Attempting to re-initialize touch sensor...");
-    
-//     // Re-initialize touch
-//     ts.begin(TOUCH_INT, TOUCH_RST);
-//     delay(100);
-    
-//     Wire.beginTransmission(0x5D);
-//     error = Wire.endTransmission();
-//     if (error == 0) {
-//       Serial.println("[I2C] Touch sensor re-initialized successfully!");
-//     } else {
-//       Serial.println("[I2C] Touch sensor re-init FAILED!");
-//     }
-//   }
-// }
 
 static void menu_btn_event_cb(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
@@ -385,6 +397,12 @@ bool load_image_to_ram(const char *path) {
 
 /* Update time display */
 void update_time_display() {
+
+  if(!time_label) {
+    return;
+  }
+
+
   unsigned long now = millis() / 1000;
   int hours = (now / 3600) % 24;
   int minutes = (now / 60) % 60;
@@ -507,12 +525,12 @@ void show_sidebar() {
             LV_SYMBOL_BATTERY_FULL " Battery",
             LV_SYMBOL_CHARGE " Voltage",
             LV_SYMBOL_WARNING " Temperature",
-            LV_SYMBOL_LIST " Statistics",
-            LV_SYMBOL_SETTINGS " Settings",
-            LV_SYMBOL_HOME " Dashboard"
+            // LV_SYMBOL_LIST " Statistics",
+            // LV_SYMBOL_SETTINGS " Settings",
+            // LV_SYMBOL_HOME " Dashboard"
         };
         
-        for(int i = 0; i < 6; i++) {
+        for(int i = 0; i < 3; i++) {
             lv_obj_t *btn = lv_btn_create(sidebar);
             lv_obj_set_width(btn, 200);
             lv_obj_set_height(btn, 45);
@@ -534,8 +552,9 @@ void show_sidebar() {
         overlay = lv_obj_create(lv_scr_act());
         lv_obj_remove_style_all(overlay);
         lv_obj_set_size(overlay, TFT_HOR_RES, TFT_VER_RES);  // Use TFT_HOR_RES and TFT_VER_RES
+        lv_obj_set_pos(overlay, 220, 0); 
         lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
-        lv_obj_set_style_bg_opa(overlay, LV_OPA_50, 0);
+        lv_obj_set_style_bg_opa(overlay, LV_OPA_0, 0);
         lv_obj_add_event_cb(overlay, overlay_event_cb, LV_EVENT_CLICKED, NULL);
     }
     
@@ -579,42 +598,117 @@ void overlay_event_cb(lv_event_t *e) {
     }
 }
 
+// static void option_cb(lv_event_t *e) {
+//     uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    
+//     // Close sidebar with callback
+//     close_sidebar();
+//     sidebar_open = false;
+    
+//     // **CRITICAL: Wait for animation, THEN switch screen**
+//     // Store the target screen ID
+//     static uint32_t pending_screen = 0;
+//     pending_screen = id;
+    
+//     // Create a timer to switch screen after animation completes
+//     lv_timer_t *timer = lv_timer_create([](lv_timer_t *t) {
+//         uint32_t screen_id = (uint32_t)(uintptr_t)t->user_data;
+        
+//         switch(screen_id) {
+//             case 0:
+//                 Serial.println("Opening Battery Screen...");
+//                 show_battery_screen();
+//                 break;
+//             case 1:
+//                 Serial.println("Opening Voltage Screen...");
+//                 show_voltage_screen();
+//                 break;
+//             case 2:
+//                 Serial.println("Opening Temperature Screen...");
+//                 show_temperature_screen();
+//                 break;
+//             case 3:
+//                 Serial.println("Opening Statistics Screen...");
+//                 show_statistics_screen();
+//                 break;
+//             case 4:
+//                 Serial.println("Opening Settings Screen...");
+//                 show_settings_screen();
+//                 break;
+//             case 5:
+//                 Serial.println("Returning to Dashboard...");
+//                 create_ev_dashboard_ui();
+//                 break;
+//         }
+        
+//         lv_timer_delete(t);  // Delete the timer after running once
+//     }, 350, (void*)(uintptr_t)id);  // 350ms = 300ms animation + 50ms buffer
+    
+//     lv_timer_set_repeat_count(timer, 1);  // Run only once
+// }
+
+
 static void option_cb(lv_event_t *e) {
     uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
     
-    // Close sidebar first
-    close_sidebar();
-    sidebar_open = false;
-    
-    // Navigate to different screens based on selection
-    switch(id) {
-        case 0: // Battery Screen
-            Serial.println("Opening Battery Screen...");
-            show_battery_screen();
-            break;
-        case 1: // Voltage Screen
-            Serial.println("Opening Voltage Screen...");
-            show_voltage_screen();
-            break;
-        case 2: // Temperature Screen
-            Serial.println("Opening Temperature Screen...");
-            show_temperature_screen();
-            break;
-        case 3: // Statistics Screen
-            Serial.println("Opening Statistics Screen...");
-            show_statistics_screen();
-            break;
-        case 4: // Settings Screen
-            Serial.println("Opening Settings Screen...");
-            show_settings_screen();
-            break;
-        case 5: // Dashboard (Home)
-            Serial.println("Returning to Dashboard...");
-            create_ev_dashboard_ui();
-            lv_refr_now(disp);
-            break;
+    // ONLY hide, set flag, and return
+    if(sidebar) {
+        lv_obj_add_flag(sidebar, LV_OBJ_FLAG_HIDDEN);
     }
+    if(overlay) {
+        lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    sidebar_open = false;
+    pending_screen = id;  // Let UI task handle it
+    
+    // DON'T call show_battery_screen() here!
 }
+
+// static void option_cb(lv_event_t *e) {
+//     uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    
+//     Serial.printf("Screen button %d pressed\n", id);
+    
+//     // **Use async delete - LVGL deletes it AFTER event finishes**
+//     if(sidebar) {
+//         lv_obj_delete_async(sidebar);  // ← Safe!
+//         sidebar = NULL;
+//     }
+//     if(overlay) {
+//         lv_obj_delete_async(overlay);  // ← Safe!
+//         overlay = NULL;
+//     }
+//     sidebar_open = false;
+    
+//     // Now safe to switch screens
+//     switch(id) {
+//         case 0:
+//             Serial.println("Opening Battery Screen...");
+//             show_battery_screen();
+//             break;
+//         case 1:
+//             Serial.println("Opening Voltage Screen...");
+//             show_voltage_screen();
+//             break;
+//         case 2:
+//             Serial.println("Opening Temperature Screen...");
+//             show_temperature_screen();
+//             break;
+//         case 3:
+//             Serial.println("Opening Statistics Screen...");
+//             show_statistics_screen();
+//             break;
+//         case 4:
+//             Serial.println("Opening Settings Screen...");
+//             show_settings_screen();
+//             break;
+//         case 5:
+//             Serial.println("Returning to Dashboard...");
+//             create_ev_dashboard_ui();
+//             break;
+//     }
+// }
 
 /* Create EV Dashboard UI */
 void create_ev_dashboard_ui() {
@@ -643,7 +737,8 @@ void create_ev_dashboard_ui() {
 
   // Create menu symbol
   lv_obj_t *menu_label = lv_label_create(menu_btn);
-  lv_label_set_text(menu_label, LV_SYMBOL_LIST);
+  lv_label_set_text(menu_label, LV_SYMBOL_BARS);
+  lv_obj_set_style_text_font(menu_label, &lv_font_montserrat_20, 0);
   lv_obj_center(menu_label);
 
   // Add event handler - Simplified version
@@ -811,7 +906,23 @@ void create_ev_dashboard_ui() {
   Serial.println("EV dashboard UI created!");
 }
 
-// 
+void clear_dashboard_pointers() {
+    speed_label = NULL;
+    range_label = NULL;
+    avg_wkm_label = NULL;
+    trip_label = NULL;
+    odo_label = NULL;
+    avg_kmh_label = NULL;
+    motor_temp_label = NULL;
+    battery_temp_label = NULL;
+    mode_label = NULL;
+    status_label = NULL;
+    soc = NULL;
+    voltage = NULL;
+    current = NULL;
+    time_label = NULL;
+    menu_btn = NULL;
+}
 
 // RS485 Task - runs on Core 0
 void rs485Task(void *parameter) {
@@ -986,9 +1097,13 @@ void rs485Task(void *parameter) {
 }
 
 void show_battery_screen() {
+    Serial.println("=== Entering show_battery_screen ===");
+    
     lv_obj_t *scr = lv_scr_act();
     lv_obj_clean(scr);
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1a1a1a), 0);
+    clear_dashboard_pointers();  // ← ONE LINE!
+
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0f1419), 0);
     
     // Back button
     lv_obj_t *back_btn = lv_btn_create(scr);
@@ -996,6 +1111,7 @@ void show_battery_screen() {
     lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 10, 10);
     lv_obj_t *back_label = lv_label_create(back_btn);
     lv_label_set_text(back_label, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_center(back_label);
     lv_obj_add_event_cb(back_btn, [](lv_event_t *e) {
         if(lv_event_get_code(e) == LV_EVENT_CLICKED) {
@@ -1055,8 +1171,13 @@ void show_battery_screen() {
 }
 
 void show_voltage_screen() {
+
+
+
     lv_obj_t *scr = lv_scr_act();
     lv_obj_clean(scr);
+    clear_dashboard_pointers();  // ← ONE LINE!
+    
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x0f1419), 0);
     
     lv_obj_t *back_btn = lv_btn_create(scr);
@@ -1107,6 +1228,8 @@ void show_voltage_screen() {
 void show_temperature_screen() {
     lv_obj_t *scr = lv_scr_act();
     lv_obj_clean(scr);
+    show_statistics_screen();
+    clear_dashboard_pointers();  // ← ONE LINE!
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x2a1a1a), 0);
     
     lv_obj_t *back_btn = lv_btn_create(scr);
@@ -1232,6 +1355,8 @@ void show_statistics_screen() {
 void show_settings_screen() {
     lv_obj_t *scr = lv_scr_act();
     lv_obj_clean(scr);
+    clear_dashboard_pointers();  // ← ONE LINE!
+
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x1a1a1a), 0);
     
     lv_obj_t *back_btn = lv_btn_create(scr);
@@ -1399,7 +1524,7 @@ void setup() {
   // This is the test code for touch:
 
   Serial.println("Touch test: Please touch the screen in the next 5 seconds...");
-  testTouch();
+  // testTouch();
 
   // Create LVGL mutex 
   // lvgl_mutex = xSemaphoreCreateMutex();
